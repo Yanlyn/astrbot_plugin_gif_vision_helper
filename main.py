@@ -1,379 +1,401 @@
+"""
+AstrBot 插件：GIF Vision Helper
+
+功能概述：
+- 识别 QQ 传输过来的 GIF 动图（哪怕本地临时文件扩展名是 .jpg/.png，但魔数仍是 GIF）。
+- 将 GIF 抽样为多帧 JPEG 静态图：
+  - 第一帧覆盖原始 temp 文件路径（兼容 AstrBot 原有调用逻辑）
+  - 其余帧追加到 ProviderRequest.image_urls 中，让视觉模型一次看到多帧
+- 根据总帧数与文件大小自适应选择抽样帧数，默认最高 6 帧
+- 为 LLM 注入一条“GIF 特殊提示”，指明这些图片是从动图抽帧而来
+- 维护自己的临时帧文件集合，并在后台异步清理过期文件
+
+部分临时文件管理与提示注入思路参考自：
+https://github.com/piexian/astrbot_plugin_gif_to_video
+"""
+
 from __future__ import annotations
 
 import asyncio
 import threading
 import time
 from pathlib import Path
-from typing import List
+from typing import Any, Optional
 
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
+from PIL.Image import DecompressionBombError  # 新增：单独引入炸弹异常
 
 from astrbot.api import logger
-from astrbot.api.event import filter, AstrMessageEvent
+from astrbot.api.event import filter
+from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star, register
-import astrbot.api.message_components as Comp
 
 
-@register(
-    "astrbot_plugin_gif_vision_helper",
-    "YanL",
-    "将 QQ 的 GIF 动图拆分为多帧静态图，并注入提示，方便多模态模型理解",
-    "0.5.0",
-)
+PLUGIN_ID = "astrbot_plugin_gif_vision_helper"
+PLUGIN_VERSION = "0.6.1"
+PLUGIN_DESC = "将 QQ 的 GIF 动图转为多帧静态图，让视觉模型真正看懂动图"
+
+
+@register(PLUGIN_ID, "YanL", PLUGIN_DESC, PLUGIN_VERSION)
 class GifVisionHelper(Star):
     """
-    v0.5 功能概览：
-
-    - 仅在检测到“本地是真 GIF 文件”时触发，静态图完全旁路。
-    - 使用 Pillow 从 GIF 中抽帧采样，生成 3~6 张代表性帧。
-    - 按最长边 768px 进行等比缩放，控制显存 / 带宽占用。
-    - 将多帧保存为本地 JPEG 文件，并写回 req.image_urls，让多模态模型走多图输入。
-    - 在 prompt 前方注入系统提示，引导模型综合多帧理解动图语义。
-    - 记录临时帧文件，插件终止时清理 + 简单 TTL（24h）过期清理。
+    GIF → 多帧 JPEG 抽样 + 提示注入 + 临时文件管理
     """
 
-    PLUGIN_NAME = "astrbot_plugin_gif_vision_helper"
-
-    def __init__(self, context: Context):
+    def __init__(self, context: Context) -> None:
         super().__init__(context)
 
-        # 临时帧管理
+        # 仅记录本插件创建的临时帧文件，不碰 AstrBot 自己的 temp 管理
         self._temp_files: set[Path] = set()
         self._temp_files_lock = threading.Lock()
-        self._cache_ttl = 86400  # 24h TTL，用于过期临时帧清理
 
-        # 抽帧 / 尺寸策略
-        self.max_preview_frames = 6   # 上限帧数
-        self.min_preview_frames = 3   # 下限帧数
-        self.default_preview_frames = 5
-        self.max_side = 768  # 统一最长边限制
+        # 轻量缓存：Path -> 创建时间戳，用于过期清理
+        self._temp_cache: dict[Path, float] = {}
+        # 默认 24 小时 TTL
+        self._cache_ttl: float = 24 * 60 * 60
 
-    async def initialize(self):
+        # Pillow 重采样算法（兼容新旧版本）
+        try:
+            # Pillow >= 10
+            self._resample_lanczos = Image.Resampling.LANCZOS  # type: ignore[attr-defined]
+        except Exception:
+            # Pillow < 10 仍然可能存在 Image.LANCZOS；再不行就退到 BICUBIC
+            self._resample_lanczos = getattr(Image, "LANCZOS", Image.BICUBIC)
+
+    async def initialize(self) -> None:
         logger.info(
-            f"[{self.PLUGIN_NAME}] 插件已初始化（v0.5，多帧抽样 + 提示注入 + 临时文件管理）"
+            f"[{PLUGIN_ID}] 插件已初始化"
         )
 
-    # ---------- 基础工具函数 ----------
-
-    def _register_temp_file(self, file_path: Path) -> None:
-        """记录临时文件，便于后续统一清理"""
-        with self._temp_files_lock:
-            self._temp_files.add(file_path)
-
-    def _cleanup_temp_files(self) -> None:
-        """插件卸载时清理所有已记录的临时文件"""
-        with self._temp_files_lock:
-            for temp in list(self._temp_files):
-                try:
-                    if temp.exists():
-                        temp.unlink()
-                    parent = temp.parent
-                    # 如果目录已经空了顺便清一下
-                    if parent.exists() and not any(parent.iterdir()):
-                        parent.rmdir()
-                except Exception as e:
-                    logger.warning(
-                        f"[{self.PLUGIN_NAME}] 清理临时文件失败: {temp} - {e}",
-                        exc_info=True,
-                    )
-                finally:
-                    self._temp_files.discard(temp)
-
-    def _cleanup_expired_cache(self) -> None:
+    async def terminate(self) -> None:
         """
-        简单 TTL 清理：删除记录中 mtime 超过 _cache_ttl 的临时帧
-        （每次 on_llm_request 调用时顺带做一下，避免长期堆积）
+        插件卸载时尽量清理自己注册的临时帧文件。
+        """
+        logger.info(f"[{PLUGIN_ID}] 插件终止，开始清理临时帧文件 …")
+        await asyncio.to_thread(self._cleanup_temp_files)
+
+    # -------------------- 临时文件管理 --------------------
+
+    def _register_temp_file(self, path: Path) -> None:
+        """
+        仅在本插件自己创建的附加帧文件上调用。
         """
         now = time.time()
         with self._temp_files_lock:
-            for temp in list(self._temp_files):
-                try:
-                    if (not temp.exists()) or now - temp.stat().st_mtime > self._cache_ttl:
-                        if temp.exists():
-                            temp.unlink()
-                        self._temp_files.discard(temp)
-                except FileNotFoundError:
-                    self._temp_files.discard(temp)
-                except Exception as e:
-                    logger.warning(
-                        f"[{self.PLUGIN_NAME}] TTL 清理失败: {temp} - {e}",
-                        exc_info=True,
-                    )
+            self._temp_files.add(path)
+            self._temp_cache[path] = now
 
-    @staticmethod
-    def _is_gif_bytes(head: bytes) -> bool:
-        """根据本地文件魔数判断是否为 GIF"""
-        return head.startswith(b"GIF87a") or head.startswith(b"GIF89a")
+    def _cleanup_temp_files(self) -> None:
+        """
+        在插件终止时调用：强制清理所有已注册的临时帧文件。
+        不操作目录，只删除文件本身，避免误伤共享 temp 目录。
+        """
+        with self._temp_files_lock:
+            paths = list(self._temp_files)
 
-    def _resize_frame(self, frame: Image.Image) -> Image.Image:
-        """按最长边 max_side 等比缩放一帧"""
-        w, h = frame.size
-        longest = max(w, h)
-        if longest <= 0 or longest <= self.max_side:
-            return frame
+        for p in paths:
+            try:
+                if p.exists():
+                    p.unlink()
+            except FileNotFoundError:
+                pass
+            except Exception as e:
+                logger.warning(f"[{PLUGIN_ID}] 清理临时文件失败 {p}: {e}")
+            finally:
+                with self._temp_files_lock:
+                    self._temp_files.discard(p)
+                    self._temp_cache.pop(p, None)
 
-        scale = self.max_side / float(longest)
-        new_size = (max(1, int(w * scale)), max(1, int(h * scale)))
+    def _cleanup_expired_cache(self) -> None:
+        """
+        按 TTL 清理过期的临时帧文件。
+
+        ⚠ 注意：该方法会被放入 asyncio.to_thread 中执行，
+        避免在 on_llm_request 里同步阻塞事件循环。
+        """
+        now = time.time()
+        with self._temp_files_lock:
+            items = list(self._temp_cache.items())
+
+        for path, ts in items:
+            if now - ts <= self._cache_ttl:
+                continue
+
+            try:
+                if path.exists():
+                    path.unlink()
+            except FileNotFoundError:
+                pass
+            except Exception as e:
+                logger.warning(f"[{PLUGIN_ID}] 清理过期临时文件失败 {path}: {e}")
+            finally:
+                with self._temp_files_lock:
+                    self._temp_cache.pop(path, None)
+                    self._temp_files.discard(path)
+
+    # -------------------- GIF 检测 + 抽样策略 --------------------
+
+    def _is_gif_file(self, path: Path) -> bool:
+        """
+        通过魔数判断是否为 GIF。
+        即便扩展名是 .jpg/.png，只要 QQ 保留了 GIF 原始二进制，这里仍能识别。
+        """
         try:
-            frame = frame.resize(new_size, Image.LANCZOS)
-        except Exception:
-            # 某些环境可能没有 LANCZOS，退回默认
-            frame = frame.resize(new_size)
-        return frame
+            with path.open("rb") as f:
+                header = f.read(6)
+        except FileNotFoundError:
+            return False
+        except OSError as e:
+            logger.warning(f"[{PLUGIN_ID}] 读取文件头失败 {path}: {e}")
+            return False
 
-    @staticmethod
-    def _evenly_sample_indices(total: int, target: int) -> List[int]:
+        return header in (b"GIF87a", b"GIF89a")
+
+    def _decide_frame_count(self, total_frames: int, file_size: int) -> int:
         """
-        从 [0, total-1] 里等间隔采样 target 个索引。
-        确保首尾一定包含（类似你给的 0% ~ 100% 分布）。
+        根据总帧数和文件体积，决定抽样帧数。
         """
-        if total <= 0:
+        if total_frames <= 1:
+            return 1
+
+        if total_frames <= 4:
+            frames = min(3, total_frames)
+        elif total_frames <= 8:
+            frames = min(4, total_frames)
+        elif total_frames <= 16:
+            frames = min(5, total_frames)
+        else:
+            frames = min(6, total_frames)
+
+        if file_size > 10 * 1024 * 1024:
+            frames = max(3, frames - 2)
+        elif file_size > 5 * 1024 * 1024:
+            frames = max(3, frames - 1)
+
+        return max(1, min(frames, total_frames))
+
+    def _sample_indices(self, n_frames: int, target: int) -> list[int]:
+        """
+        在 [0, n_frames-1] 区间等间距抽样 target 个帧索引。
+        确保包含首尾帧。
+        """
+        if n_frames <= 0:
             return []
-        if target >= total:
-            return list(range(total))
+        if target <= 1 or n_frames <= target:
+            return list(range(min(n_frames, target)))
 
-        # 使用 (i/(target-1)) * (total-1) 这样的等间隔方案
-        indices = []
-        for i in range(target):
-            pos = round(i * (total - 1) / (target - 1))
-            if pos not in indices:
-                indices.append(pos)
-        indices.sort()
+        step = (n_frames - 1) / (target - 1)
+        indices = sorted({int(round(i * step)) for i in range(target)})
+        if not indices:
+            return [0]
+
+        indices[0] = 0
+        indices[-1] = n_frames - 1
         return indices
 
-    def _decide_preview_frame_count(self, frame_count: int, file_size_kb: float) -> int:
+    def _resize_frame(self, img: Image.Image, max_side: int) -> Image.Image:
         """
-        根据 GIF 总帧数 + 文件体积动态决定抽样帧数。
-        只是一个经验规则，可以按你之后实际体验继续微调。
+        按最长边等比例缩放到不超过 max_side，使用 LANCZOS（或兼容降级）。
         """
-        # 小而精：体积小、帧数也不多，多给一点上下文
-        if frame_count <= 20 and file_size_kb <= 512:
-            target = self.max_preview_frames  # 6
+        w, h = img.size
+        longest = max(w, h)
+        if longest <= max_side:
+            return img
 
-        # 中等：默认 4~5 帧
-        elif frame_count <= 80 and file_size_kb <= 2048:
-            target = self.default_preview_frames  # 5
+        scale = max_side / float(longest)
+        new_size = (int(w * scale), int(h * scale))
 
-        # 大而长：非常长或非常大，降到 3~4 帧，避免爆显存
-        else:
-            target = max(self.min_preview_frames, self.default_preview_frames - 1)  # 至少 3
-
-        # 不超过真实帧数
-        target = max(self.min_preview_frames if frame_count > 1 else 1, min(target, frame_count))
-        return target
-
-    def _extract_sampled_frames(self, gif_path: Path) -> List[Image.Image]:
-        """
-        从本地 GIF 文件抽取若干代表性帧（已经做尺寸压缩）。
-
-        返回值：若干 Pillow Image 对象（RGB，最长边不超过 max_side）
-        """
-        file_size_kb = 0.0
         try:
-            if gif_path.exists():
-                file_size_kb = gif_path.stat().st_size / 1024.0
-        except Exception:
-            pass
+            return img.resize(new_size, resample=self._resample_lanczos)
+        except Exception as e:
+            logger.warning(
+                f"[{PLUGIN_ID}] 帧缩放使用 LANCZOS 失败，将使用 Pillow 默认算法: {e}"
+            )
+            return img.resize(new_size)
 
-        frames: List[Image.Image] = []
-        with Image.open(str(gif_path)) as img:
-            if not getattr(img, "is_animated", False):
-                # 退化为单张图
-                frame = img.convert("RGB")
-                frame = self._resize_frame(frame)
-                frames.append(frame)
-                return frames
+    # -------------------- 提示注入 --------------------
 
-            total_frames = getattr(img, "n_frames", 1) or 1
-            target = self._decide_preview_frame_count(total_frames, file_size_kb)
-            indices = self._evenly_sample_indices(total_frames, target)
-
-            for idx in indices:
-                try:
-                    img.seek(idx)
-                    frame = img.convert("RGB")
-                    frame = self._resize_frame(frame)
-                    frames.append(frame.copy())
-                except EOFError:
-                    logger.warning(
-                        f"[{self.PLUGIN_NAME}] 抽帧时出现 EOFError，frame_idx={idx}, total={total_frames}"
-                    )
-                except Exception as e:
-                    logger.warning(
-                        f"[{self.PLUGIN_NAME}] 抽帧失败 frame_idx={idx}: {e}",
-                        exc_info=True,
-                    )
-
-        if not frames:
-            # 极端情况下至少返回一帧
-            with Image.open(str(gif_path)) as img:
-                frame = img.convert("RGB")
-                frame = self._resize_frame(frame)
-                frames.append(frame)
-        return frames
-
-    def _inject_preview_hint(self, prompt: str | None, frame_count: int) -> str:
+    def _inject_preview_hint(self, original_prompt: Optional[str], frame_count: int) -> str:
         """
-        在 prompt 中注入说明，提醒 LLM 这一次看到的是“GIF 多帧静态预览”。
+        为 LLM 注入“这是动图抽帧”的系统提示，尽量不破坏原始 prompt 语义。
         """
         if frame_count > 1:
             hint = (
-                f"[系统提示] 检测到一张 GIF 动图，本插件已从中抽取 {frame_count} 帧静态图片。"
-                f" 请综合所有帧理解整段动画的内容、时序和情绪变化。"
+                f"[系统提示] 本次用户发送的是 GIF 动图，"
+                f"插件已将其抽样为 {frame_count} 帧静态图片。"
+                f"请综合所有帧理解完整的动作和表情变化，不要只依据第一张图。"
             )
         else:
             hint = (
-                "[系统提示] 检测到 GIF 动图，但仅成功提取到 1 帧静态图片；"
-                "请结合这帧画面和聊天上下文进行理解。"
+                "[系统提示] 本次用户发送的是 GIF 动图，"
+                "但只成功保留了第一帧静态图片，可能丢失部分动作信息，"
+                "请结合上下文和细节进行合理推断。"
             )
 
-        prompt = prompt or ""
-        if hint in prompt:
-            return prompt
-        return f"{hint}\n{prompt}" if prompt else hint
+        original_prompt = original_prompt or ""
+        if hint in original_prompt:
+            return original_prompt
 
-    def _convert_gif_to_multi_jpeg(self, gif_path: Path, req) -> None:
+        if not original_prompt:
+            return hint
+        return f"{hint}\n\n{original_prompt}"
+
+    # -------------------- GIF → 多帧 JPEG 核心逻辑 --------------------
+
+    def _convert_gif_to_multi_jpeg(
+        self,
+        main_path: Path,
+        max_side: int,
+    ) -> tuple[list[Path], int]:
         """
-        核心同步逻辑：
-        - 抽帧 + 缩放 -> 得到若干 Pillow Image
-        - 覆盖原 image_urls[0] 为首帧 JPEG
-        - 附加额外帧到 image_urls，其余字段不变
-        - 注入系统提示到 prompt
+        核心：把 main_path 指向的 GIF 文件抽样为若干 JPEG 帧。
+
+        ⚠ 重要语义约定：
+        - 任何异常（包括 Pillow 的 DecompressionBombError）都会被捕获并记录日志，
+          然后返回 ([], 0)，上层将“放行原始请求”，不拦截也不清空图片。
         """
-        # 安全判断：确认真的是 GIF
         try:
-            with open(gif_path, "rb") as f:
-                head = f.read(8)
+            file_size = main_path.stat().st_size
         except FileNotFoundError:
+            return [], 0
+
+        paths: list[Path] = []
+
+        try:
+            with Image.open(main_path) as im:
+                total_frames = getattr(im, "n_frames", 1)
+
+                # 非动图：仅保证为 JPEG 并按需缩放
+                if total_frames <= 1:
+                    rgb = im.convert("RGB")
+                    frame0 = self._resize_frame(rgb, max_side)
+                    frame0.save(main_path, format="JPEG", quality=90)
+                    return [main_path], 1
+
+                target = self._decide_frame_count(total_frames, file_size)
+                indices = self._sample_indices(total_frames, target)
+                if not indices:
+                    return [], 0
+
+                parent = main_path.parent
+                stem = main_path.stem
+                suffix = ".jpg"
+
+                first = True
+                real_count = 0
+
+                for frame_idx in indices:
+                    try:
+                        im.seek(frame_idx)
+                        frame = im.convert("RGB")
+                    except (EOFError, UnidentifiedImageError):
+                        # 某些 GIF 标记帧数比实际可读帧数多，跳过异常帧
+                        continue
+
+                    frame_resized = self._resize_frame(frame, max_side)
+
+                    if first:
+                        out_path = main_path
+                        first = False
+                    else:
+                        out_path = parent / f"{stem}_f{frame_idx}{suffix}"
+
+                    frame_resized.save(out_path, format="JPEG", quality=90)
+                    paths.append(out_path)
+                    real_count += 1
+
+                    if out_path is not main_path:
+                        self._register_temp_file(out_path)
+
+                if not paths:
+                    return [], 0
+
+                return paths, real_count
+
+        except DecompressionBombError as e:
+            # 日志里的炸弹异常，现在只打 warning，不再一大坨 error+traceback
             logger.warning(
-                f"[{self.PLUGIN_NAME}] 本地 GIF 路径不存在，跳过处理: {gif_path}"
+                f"[{PLUGIN_ID}] GIF 触发 Pillow DecompressionBomb 防御，"
+                f"已放弃拆帧并回退到原始请求: {e}"
             )
-            return
+            return [], 0
+
         except Exception as e:
-            logger.warning(
-                f"[{self.PLUGIN_NAME}] 读取 GIF 头部失败: {gif_path} - {e}",
+            # 其它真正异常仍然视为 error，保留堆栈便于调试
+            logger.error(f"[{PLUGIN_ID}] 处理 GIF 时发生异常: {e}", exc_info=True)
+            return [], 0
+
+    # -------------------- LLM 请求 Hook --------------------
+
+    @filter.on_llm_request()
+    async def on_llm_request(self, event: Any, req: ProviderRequest) -> ProviderRequest:
+        """
+        在 AstrBot 准备调用视觉 LLM 之前拦截请求。
+        """
+        _ = event  # 当前版本未使用
+
+        image_urls: Any = getattr(req, "image_urls", None)
+        if not image_urls or not isinstance(image_urls, list):
+            return req
+
+        first_path = image_urls[0]
+        if not isinstance(first_path, str):
+            return req
+
+        main_path = Path(first_path)
+
+        # 仅当本地文件头确认为 GIF 时才介入，避免误伤正常 JPEG
+        if not self._is_gif_file(main_path):
+            return req
+
+        # 异步后台清理过期临时帧文件（不会阻塞当前请求）
+        asyncio.create_task(asyncio.to_thread(self._cleanup_expired_cache))
+
+        max_side = 768  # baseline 分辨率上限
+
+        logger.info(
+            f"[{PLUGIN_ID}] on_llm_request 捕获到图片请求，尝试处理 GIF: {main_path}"
+        )
+
+        try:
+            frame_paths, frame_count = await asyncio.to_thread(
+                self._convert_gif_to_multi_jpeg,
+                main_path,
+                max_side,
+            )
+        except Exception as e:
+            # 理论上不会走到这里，因为内部已经吃掉了异常；这里只做兜底日志
+            logger.error(
+                f"[{PLUGIN_ID}] GIF 转多帧 JPEG 失败（外层兜底），将回退到原始请求: {e}",
                 exc_info=True,
             )
-            return
+            return req
 
-        if not self._is_gif_bytes(head):
-            # 头部不是 GIF，直接忽略
-            logger.debug(
-                f"[{self.PLUGIN_NAME}] 本地文件魔数非 GIF，直接旁路: {gif_path}"
-            )
-            return
+        # 如果没能成功抽出任何帧，就保持行为与之前一致：完全不改 req
+        if not frame_paths or frame_count <= 0:
+            return req
 
-        # 抽样出多帧
-        frames = self._extract_sampled_frames(gif_path)
-        if not frames:
-            logger.warning(
-                f"[{self.PLUGIN_NAME}] 从 GIF 中未能成功抽出任何帧，保持原始行为。"
-            )
-            return
+        # 第一帧覆盖原始路径，其余帧追加到 image_urls
+        new_urls: list[str] = [str(frame_paths[0])]
+        if len(image_urls) > 1:
+            new_urls.extend(str(u) for u in image_urls[1:] if isinstance(u, str))
+        for extra in frame_paths[1:]:
+            new_urls.append(str(extra))
 
-        # 确保 req.image_urls 存在
-        if not hasattr(req, "image_urls") or req.image_urls is None:
-            req.image_urls = []
+        try:
+            req.image_urls = new_urls  # type: ignore[attr-defined]
+        except Exception:
+            pass
 
-        # 原始 image_urls
-        old_urls: List[str] = list(req.image_urls)
-
-        new_urls: List[str] = []
-        parent_dir = gif_path.parent
-        stem = gif_path.stem  # 通常是 AstrBot 自动命名的 temp 文件名
-
-        for idx, frame in enumerate(frames):
-            if idx == 0:
-                # 覆盖原路径：让之前会报错的“GIF 文件”摇身一变，成为首帧 JPEG
-                out_path = gif_path
-            else:
-                # 额外帧：追加新的临时文件
-                out_path = parent_dir / f"{stem}_fv{idx}.jpg"
-
-            try:
-                frame.save(str(out_path), format="JPEG", quality=92, optimize=True)
-            except Exception as e:
-                logger.warning(
-                    f"[{self.PLUGIN_NAME}] 写入帧失败 idx={idx}, path={out_path}: {e}",
-                    exc_info=True,
-                )
-                continue
-
-            if idx > 0:
-                # 首帧就是原 temp 文件，不额外登记；其他帧需要登记以便后续清理
-                self._register_temp_file(out_path)
-
-            new_urls.append(str(out_path))
-
-        if not new_urls:
-            logger.warning(
-                f"[{self.PLUGIN_NAME}] 没有成功生成任何 JPEG 帧，保留原始 image_urls。"
-            )
-            return
-
-        # 将新帧列表写回 image_urls，保留原本的“多图场景”语义
-        if old_urls:
-            # 假设当前 GIF 对应第 0 个索引（AstrBot 当前实现里图片描述一般就是这样）
-            rest = old_urls[1:]
-            req.image_urls = new_urls + rest
-        else:
-            req.image_urls = new_urls
-
-        # 注入系统提示到 prompt
-        current_prompt = getattr(req, "prompt", "")
-        req.prompt = self._inject_preview_hint(current_prompt, len(new_urls))
+        current_prompt = getattr(req, "prompt", None)
+        try:
+            req.prompt = self._inject_preview_hint(current_prompt, frame_count)  # type: ignore[attr-defined]
+        except Exception:
+            pass
 
         logger.info(
-            f"[{self.PLUGIN_NAME}] GIF 已成功拆分为 {len(new_urls)} 帧 JPEG，"
-            f"第 1 帧覆盖原路径，其余帧追加到 image_urls。"
+            f"[{PLUGIN_ID}] GIF 已拆分为 {frame_count} 帧 JPEG，"
+            f"image_urls 数量从 {len(image_urls)} → {len(new_urls)}"
         )
 
-    # ---------- LLM 请求钩子 ----------
-
-    @filter.on_llm_request(priority=100)
-    async def on_llm_request(self, event: AstrMessageEvent, req):
-        """
-        关键 hook：
-        - 检测当前消息是否包含 QQ 图片（不区分静态/动图）
-        - 定位对应的本地 temp 文件路径（req.image_urls[0]）
-        - 若本地魔数显示为 GIF -> 抽帧 + 多图注入 + 提示注入
-        """
-        # 顺便做一轮 TTL 清理
-        self._cleanup_expired_cache()
-
-        # 保护性判空
-        msg_obj = getattr(event, "message_obj", None)
-        if msg_obj is None:
-            return
-
-        msg_chain = getattr(msg_obj, "message", None)
-        if not isinstance(msg_chain, list) or not msg_chain:
-            return
-
-        # 当前场景主要考虑“单图 + 描述”：只要发现有 Image 组件就继续
-        has_image = any(isinstance(c, Comp.Image) for c in msg_chain)
-        if not has_image:
-            return
-
-        # ProviderRequest 里应该已经填充了本地下载后的 temp 路径
-        image_urls = getattr(req, "image_urls", None)
-        if not image_urls:
-            logger.debug(
-                f"[{self.PLUGIN_NAME}] 发现图片组件，但 ProviderRequest.image_urls 为空，跳过。"
-            )
-            return
-
-        # 当前版本假定“本轮描述的主图”对应第 0 个索引
-        gif_path = Path(image_urls[0])
-
-        logger.info(
-            f"[{self.PLUGIN_NAME}] on_llm_request 捕获到图片请求，尝试处理 GIF: {gif_path}"
-        )
-
-        # 在独立线程里做所有 IO / CPU 操作，避免阻塞事件循环
-        await asyncio.to_thread(self._convert_gif_to_multi_jpeg, gif_path, req)
-
-    async def terminate(self):
-        """插件被卸载 / AstrBot 退出时调用"""
-        logger.info(f"[{self.PLUGIN_NAME}] 插件终止，开始清理临时文件")
-        self._cleanup_temp_files()
+        return req

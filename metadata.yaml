@@ -1,6 +1,6 @@
 name: astrbot_plugin_gif_vision_helper
-version: 0.5.0
+display_name: GIF Vision Helper
+version: 0.6.1
 author: YanL
 desc: 将QQ GIF动图拆成多帧静态图，让多模态模型真正看懂动图
 repo: https://github.com/Yanlyn/astrbot_plugin_gif_vision_helper
-display_name: GIF Vision Helper
