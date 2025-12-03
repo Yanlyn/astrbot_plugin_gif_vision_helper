@@ -8,6 +8,8 @@ AstrBot 插件：GIF Vision Helper
 
 把 GIF 拆分成多帧静态图片，再交给多模态模型，让它真正按“动图”来理解，而不是报错。
 
+为了避免重复造轮子，参考了[GitHub - piexian/astrbot\_plugin\_gif\_to\_video: GIF转视频分析插件，自动为默认服务商或手动指定的服务商启用GIF转视频避免报错。](https://github.com/piexian/astrbot_plugin_gif_to_video)的部分代码段，特此感谢。
+
   
 
 ## 功能
