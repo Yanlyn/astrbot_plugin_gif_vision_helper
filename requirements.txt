@@ -1,2 +1,1 @@
-aiohttp
-Pillow
+pillow>=10.0.0

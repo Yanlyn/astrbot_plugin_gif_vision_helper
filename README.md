@@ -40,12 +40,13 @@ AstrBot/
 3. 重启 AstrBot 或在面板中重载插件。
 4. 在控制台中看到类似日志，说明插件已生效：
 
-[astrbot_plugin_gif_vision_helper] 插件已初始化（v0.5，多帧抽样 + 提示注入 + 临时文件管理）
+	[astrbot_plugin_gif_vision_helper] 插件已初始化（v0.5，多帧抽样 + 提示注入 + 临时文件管理）
 
 典型日志（已成功处理 GIF 的情况）：
 
-[astrbot_plugin_gif_vision_helper] on_llm_request 捕获到图片请求，尝试处理 GIF: /AstrBot/data/temp/1764734982_33f14bb1.jpg
-[astrbot_plugin_gif_vision_helper] GIF 已成功拆分为 6 帧 JPEG，第 1 帧覆盖原路径，其余帧追加到 image_urls。
+	[astrbot_plugin_gif_vision_helper] on_llm_request 捕获到图片请求，尝试处理 GIF: /AstrBot/data/temp/1764734982_33f14bb1.jpg
+	
+	[astrbot_plugin_gif_vision_helper] GIF 已成功拆分为 6 帧 JPEG，第 1 帧覆盖原路径，其余帧追加到 image_urls。
 
 
 配置
